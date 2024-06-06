@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -390,7 +391,7 @@ var nftablesJumpChains = []nftablesJumpChain{
 // ensureChain adds commands to tx to ensure that chain exists and doesn't contain
 // anything from before this transaction (using createdChains to ensure that we don't
 // Flush a chain more than once and lose *new* rules as well.)
-func ensureChain(chain string, tx *knftables.Transaction, createdChains sets.Set[string]) {
+func ensureChain(chain string, tx *knftables.Transaction, createdChains sets.Set[string], existingChainRules map[string]map[string]*int) {
 	if createdChains.Has(chain) {
 		return
 	}
@@ -398,6 +399,12 @@ func ensureChain(chain string, tx *knftables.Transaction, createdChains sets.Set
 	if tx == nil {
 		return
 	}
+	if existingChainRules != nil {
+		if _, ok := existingChainRules[chain]; ok {
+			return
+		}
+	}
+
 	tx.Add(&knftables.Chain{
 		Name: chain,
 	})
@@ -450,7 +457,7 @@ func (proxier *Proxier) setupNFTables(tx *knftables.Transaction) {
 	// Create and flush ordinary chains and add rules jumping to them
 	createdChains := sets.New[string]()
 	for _, c := range nftablesJumpChains {
-		ensureChain(c.dstChain, tx, createdChains)
+		ensureChain(c.dstChain, tx, createdChains, nil)
 		tx.Add(&knftables.Rule{
 			Chain: c.srcChain,
 			Rule: knftables.Concat(
@@ -462,7 +469,7 @@ func (proxier *Proxier) setupNFTables(tx *knftables.Transaction) {
 
 	// Ensure all of our other "top-level" chains exist
 	for _, chain := range []string{servicesChain, clusterIPsCheckChain, masqueradingChain, markMasqChain} {
-		ensureChain(chain, tx, createdChains)
+		ensureChain(chain, tx, createdChains, nil)
 	}
 
 	// Add the rules in the mark-for-masquerade and masquerading chains
@@ -612,7 +619,7 @@ func (proxier *Proxier) setupNFTables(tx *knftables.Transaction) {
 		Comment: ptr.To("destinations that are subject to LoadBalancerSourceRanges"),
 	})
 
-	ensureChain(firewallCheckChain, tx, createdChains)
+	ensureChain(firewallCheckChain, tx, createdChains, nil)
 	tx.Add(&knftables.Rule{
 		Chain: firewallCheckChain,
 		Rule: knftables.Concat(
@@ -1190,6 +1197,35 @@ func (proxier *Proxier) syncProxyRules() {
 	proxier.noEndpointNodePorts.resetLeftoverKeys()
 	proxier.serviceNodePorts.resetLeftoverKeys()
 
+	listStart := time.Now()
+	rules, err := proxier.nftables.ListRules(context.TODO(), "")
+	if err != nil {
+		proxier.logger.Error(err, "Failed to list nftables rules")
+		//nothing to do, chains are flushed by ensureChain
+	}
+	proxier.logger.V(2).Info("List rules", "elapsed", time.Since(listStart), "len", len(rules))
+	// map[chainName][rule1, ..., ruleN]
+	existingChainRules := map[string]map[string]*int{}
+	for _, rule := range rules {
+		if _, ok := existingChainRules[rule.Chain]; !ok {
+			existingChainRules[rule.Chain] = map[string]*int{}
+		}
+		existingChainRules[rule.Chain][rule.Rule] = rule.Handle
+	}
+
+	listStart = time.Now()
+	chains, err := proxier.nftables.List(context.TODO(), "chains")
+	if err != nil {
+		proxier.logger.Error(err, "Failed to list nftables chains")
+		//nothing to do, chains are flushed by ensureChain
+	}
+	proxier.logger.V(2).Info("List chains", "elapsed", time.Since(listStart))
+	for _, chain := range chains {
+		if _, ok := existingChainRules[chain]; !ok {
+			existingChainRules[chain] = map[string]*int{}
+		}
+	}
+
 	// Accumulate service/endpoint chains and affinity sets to keep.
 	activeChains := sets.New[string]()
 	activeAffinitySets := sets.New[string]()
@@ -1236,7 +1272,7 @@ func (proxier *Proxier) syncProxyRules() {
 		// Note the endpoint chains that will be used
 		for _, ep := range allLocallyReachableEndpoints {
 			if epInfo, ok := ep.(*endpointInfo); ok {
-				ensureChain(epInfo.chainName, svcTx, activeChains)
+				ensureChain(epInfo.chainName, svcTx, activeChains, existingChainRules)
 			}
 		}
 
@@ -1244,14 +1280,14 @@ func (proxier *Proxier) syncProxyRules() {
 		clusterPolicyChain := svcInfo.clusterPolicyChainName
 		usesClusterPolicyChain := len(clusterEndpoints) > 0 && svcInfo.UsesClusterEndpoints()
 		if usesClusterPolicyChain {
-			ensureChain(clusterPolicyChain, svcTx, activeChains)
+			ensureChain(clusterPolicyChain, svcTx, activeChains, existingChainRules)
 		}
 
 		// localPolicyChain contains the endpoints used with "Local" traffic policy
 		localPolicyChain := svcInfo.localPolicyChainName
 		usesLocalPolicyChain := len(localEndpoints) > 0 && svcInfo.UsesLocalEndpoints()
 		if usesLocalPolicyChain {
-			ensureChain(localPolicyChain, svcTx, activeChains)
+			ensureChain(localPolicyChain, svcTx, activeChains, existingChainRules)
 		}
 
 		// internalPolicyChain is the chain containing the endpoints for
@@ -1293,7 +1329,7 @@ func (proxier *Proxier) syncProxyRules() {
 		// are no externally-usable endpoints.
 		usesExternalTrafficChain := hasEndpoints && svcInfo.ExternallyAccessible()
 		if usesExternalTrafficChain {
-			ensureChain(externalTrafficChain, svcTx, activeChains)
+			ensureChain(externalTrafficChain, svcTx, activeChains, existingChainRules)
 		}
 
 		var internalTrafficFilterVerdict, externalTrafficFilterVerdict string
@@ -1395,7 +1431,7 @@ func (proxier *Proxier) syncProxyRules() {
 		usesFWChain := len(svcInfo.LoadBalancerVIPs()) > 0 && len(svcInfo.LoadBalancerSourceRanges()) > 0
 		fwChain := svcInfo.firewallChainName
 		if usesFWChain {
-			ensureChain(fwChain, svcTx, activeChains)
+			ensureChain(fwChain, svcTx, activeChains, existingChainRules)
 			var sources []string
 			allowFromNode := false
 			for _, cidr := range svcInfo.LoadBalancerSourceRanges() {
@@ -1417,13 +1453,13 @@ func (proxier *Proxier) syncProxyRules() {
 					sources = append(sources, ",", lbip.String())
 				}
 			}
-			ensureObj(&knftables.Rule{
+			ensureRule(&knftables.Rule{
 				Chain: fwChain,
 				Rule: knftables.Concat(
 					ipX, "saddr", "!=", "{", sources, "}",
 					"drop",
 				),
-			}, svcTx)
+			}, existingChainRules, tx)
 		}
 
 		// Capture load-balancer ingress.
@@ -1515,21 +1551,21 @@ func (proxier *Proxier) syncProxyRules() {
 		// Set up internal traffic handling.
 		if hasInternalEndpoints {
 			if proxier.masqueradeAll {
-				ensureObj(&knftables.Rule{
+				ensureRule(&knftables.Rule{
 					Chain: internalTrafficChain,
 					Rule: knftables.Concat(
 						ipX, "daddr", svcInfo.ClusterIP(),
 						protocol, "dport", svcInfo.Port(),
 						"jump", markMasqChain,
 					),
-				}, svcTx)
+				}, existingChainRules, tx)
 			} else if proxier.localDetector.IsImplemented() {
 				// This masquerades off-cluster traffic to a service VIP. The
 				// idea is that you can establish a static route for your
 				// Service range, routing to any node, and that node will
 				// bridge into the Service for you. Since that might bounce
 				// off-node, we masquerade here.
-				ensureObj(&knftables.Rule{
+				ensureRule(&knftables.Rule{
 					Chain: internalTrafficChain,
 					Rule: knftables.Concat(
 						ipX, "daddr", svcInfo.ClusterIP(),
@@ -1537,7 +1573,7 @@ func (proxier *Proxier) syncProxyRules() {
 						proxier.localDetector.IfNotLocalNFT(),
 						"jump", markMasqChain,
 					),
-				}, svcTx)
+				}, existingChainRules, tx)
 			}
 		}
 
@@ -1549,12 +1585,12 @@ func (proxier *Proxier) syncProxyRules() {
 			if !svcInfo.ExternalPolicyLocal() {
 				// If we are using non-local endpoints we need to masquerade,
 				// in case we cross nodes.
-				ensureObj(&knftables.Rule{
+				ensureRule(&knftables.Rule{
 					Chain: externalTrafficChain,
 					Rule: knftables.Concat(
 						"jump", markMasqChain,
 					),
-				}, svcTx)
+				}, existingChainRules, tx)
 			} else {
 				// If we are only using same-node endpoints, we can retain the
 				// source IP in most cases.
@@ -1564,49 +1600,49 @@ func (proxier *Proxier) syncProxyRules() {
 					// traffic as a special-case.  It is subject to neither
 					// form of traffic policy, which simulates going up-and-out
 					// to an external load-balancer and coming back in.
-					ensureObj(&knftables.Rule{
+					ensureRule(&knftables.Rule{
 						Chain: externalTrafficChain,
 						Rule: knftables.Concat(
 							proxier.localDetector.IfLocalNFT(),
 							"goto", clusterPolicyChain,
 						),
 						Comment: ptr.To("short-circuit pod traffic"),
-					}, svcTx)
+					}, existingChainRules, tx)
 				}
 
 				// Locally originated traffic (not a pod, but the host node)
 				// still needs masquerade because the LBIP itself is a local
 				// address, so that will be the chosen source IP.
-				ensureObj(&knftables.Rule{
+				ensureRule(&knftables.Rule{
 					Chain: externalTrafficChain,
 					Rule: knftables.Concat(
 						"fib", "saddr", "type", "local",
 						"jump", markMasqChain,
 					),
 					Comment: ptr.To("masquerade local traffic"),
-				}, svcTx)
+				}, existingChainRules, tx)
 
 				// Redirect all src-type=LOCAL -> external destination to the
 				// policy=cluster chain. This allows traffic originating
 				// from the host to be redirected to the service correctly.
-				ensureObj(&knftables.Rule{
+				ensureRule(&knftables.Rule{
 					Chain: externalTrafficChain,
 					Rule: knftables.Concat(
 						"fib", "saddr", "type", "local",
 						"goto", clusterPolicyChain,
 					),
 					Comment: ptr.To("short-circuit local traffic"),
-				}, svcTx)
+				}, existingChainRules, tx)
 			}
 
 			// Anything else falls thru to the appropriate policy chain.
 			if hasExternalEndpoints {
-				ensureObj(&knftables.Rule{
+				ensureRule(&knftables.Rule{
 					Chain: externalTrafficChain,
 					Rule: knftables.Concat(
 						"goto", externalPolicyChain,
 					),
-				}, svcTx)
+				}, existingChainRules, tx)
 			}
 		}
 
@@ -1650,13 +1686,13 @@ func (proxier *Proxier) syncProxyRules() {
 		// If Cluster policy is in use, create the chain and create rules jumping
 		// from clusterPolicyChain to the clusterEndpoints
 		if usesClusterPolicyChain {
-			proxier.writeServiceToEndpointRules(svcTx, svcInfo, clusterPolicyChain, clusterEndpoints)
+			proxier.writeServiceToEndpointRules(svcTx, svcInfo, clusterPolicyChain, clusterEndpoints, existingChainRules)
 		}
 
 		// If Local policy is in use, create rules jumping from localPolicyChain
 		// to the localEndpoints
 		if usesLocalPolicyChain {
-			proxier.writeServiceToEndpointRules(svcTx, svcInfo, localPolicyChain, localEndpoints)
+			proxier.writeServiceToEndpointRules(svcTx, svcInfo, localPolicyChain, localEndpoints, existingChainRules)
 		}
 
 		// Generate the per-endpoint chains
@@ -1670,33 +1706,33 @@ func (proxier *Proxier) syncProxyRules() {
 			endpointChain := epInfo.chainName
 
 			// Handle traffic that loops back to the originator with SNAT.
-			ensureObj(&knftables.Rule{
+			ensureRule(&knftables.Rule{
 				Chain: endpointChain,
 				Rule: knftables.Concat(
 					ipX, "saddr", epInfo.IP(),
 					"jump", markMasqChain,
 				),
-			}, svcTx)
+			}, existingChainRules, tx)
 
 			// Handle session affinity
 			if svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP {
-				ensureObj(&knftables.Rule{
+				ensureRule(&knftables.Rule{
 					Chain: endpointChain,
 					Rule: knftables.Concat(
 						"update", "@", epInfo.affinitySetName,
 						"{", ipX, "saddr", "}",
 					),
-				}, svcTx)
+				}, existingChainRules, tx)
 			}
 
 			// DNAT to final destination.
-			ensureObj(&knftables.Rule{
+			ensureRule(&knftables.Rule{
 				Chain: endpointChain,
 				Rule: knftables.Concat(
 					"meta l4proto", protocol,
 					"dnat to", epInfo.String(),
 				),
-			}, svcTx)
+			}, existingChainRules, tx)
 		}
 	}
 
@@ -1706,26 +1742,34 @@ func (proxier *Proxier) syncProxyRules() {
 	// short amount of time later that the chain is now unreferenced. So we flush them
 	// now, and record the time that they become stale in staleChains so they can be
 	// deleted later.
-	existingChains, err := proxier.nftables.List(context.TODO(), "chains")
-	if err == nil {
-		for _, chain := range existingChains {
-			if isServiceChainName(chain) {
-				if !activeChains.Has(chain) {
-					tx.Flush(&knftables.Chain{
-						Name: chain,
+	deletedChains := 0
+	deletedRules := 0
+	for chain, chainRules := range existingChainRules {
+		if isServiceChainName(chain) {
+			if !activeChains.Has(chain) {
+				tx.Flush(&knftables.Chain{
+					Name: chain,
+				})
+				deletedChains += 1
+				proxier.staleChains[chain] = start
+			} else {
+				delete(proxier.staleChains, chain)
+				for rule, handle := range chainRules {
+					deletedRules += 1
+					tx.Delete(&knftables.Rule{
+						Chain:  chain,
+						Rule:   rule,
+						Handle: handle,
 					})
-					proxier.staleChains[chain] = start
-				} else {
-					delete(proxier.staleChains, chain)
 				}
 			}
 		}
-	} else if !knftables.IsNotFound(err) {
-		proxier.logger.Error(err, "Failed to list nftables chains: stale chains will not be deleted")
 	}
 
+	proxier.logger.V(2).Info("Deleted stale nftables chains", "activeChains", activeChains.Len(), "numChains", deletedChains, "numRules", deletedRules)
+
 	// OTOH, we can immediately delete any stale affinity sets
-	listStart := time.Now()
+	listStart = time.Now()
 	existingSets, err := proxier.nftables.List(context.TODO(), "sets")
 	proxier.logger.V(2).Info("List sets", "elapsed", time.Since(listStart))
 	if err == nil {
@@ -1807,7 +1851,19 @@ func ensureObj(obj knftables.Object, tx *knftables.Transaction) {
 	}
 }
 
-func (proxier *Proxier) writeServiceToEndpointRules(tx *knftables.Transaction, svcInfo *servicePortInfo, svcChain string, endpoints []proxy.Endpoint) {
+func ensureRule(rule *knftables.Rule, existingChainRules map[string]map[string]*int, tx *knftables.Transaction) {
+	chainRules, ok := existingChainRules[rule.Chain]
+	if ok {
+		if _, ok2 := chainRules[rule.Rule]; ok2 {
+			delete(chainRules, rule.Rule)
+			return
+		}
+	}
+	tx.Add(rule)
+}
+
+func (proxier *Proxier) writeServiceToEndpointRules(tx *knftables.Transaction, svcInfo *servicePortInfo, svcChain string,
+	endpoints []proxy.Endpoint, existingChainRules map[string]map[string]*int) {
 	// First write session affinity rules, if applicable.
 	if svcInfo.SessionAffinityType() == v1.ServiceAffinityClientIP {
 		ipX := "ip"
@@ -1821,36 +1877,45 @@ func (proxier *Proxier) writeServiceToEndpointRules(tx *knftables.Transaction, s
 				continue
 			}
 
-			ensureObj(&knftables.Rule{
+			ensureRule(&knftables.Rule{
 				Chain: svcChain,
 				Rule: knftables.Concat(
 					ipX, "saddr", "@", epInfo.affinitySetName,
 					"goto", epInfo.chainName,
 				),
-			}, tx)
+			}, existingChainRules, tx)
 		}
 	}
 
+	// TODO figure out if endpoints are already sorted
+	sort.Slice(endpoints, func(i, j int) bool {
+		return endpoints[i].IP() < endpoints[j].IP()
+	})
+
 	// Now write loadbalancing rule
-	var elements []string
+	elements := make([]string, 0, len(endpoints)*4)
 	for i, ep := range endpoints {
 		epInfo, ok := ep.(*endpointInfo)
 		if !ok {
 			continue
 		}
 
-		elements = append(elements,
-			strconv.Itoa(i), ":", "goto", epInfo.chainName,
-		)
+		chainName := epInfo.chainName
 		if i != len(endpoints)-1 {
-			elements = append(elements, ",")
+			chainName += ","
 		}
+
+		elements = append(elements,
+			strconv.Itoa(i), ":", "goto", chainName,
+		)
+
 	}
-	ensureObj(&knftables.Rule{
+
+	ensureRule(&knftables.Rule{
 		Chain: svcChain,
 		Rule: knftables.Concat(
 			"numgen random mod", len(endpoints), "vmap",
 			"{", elements, "}",
 		),
-	}, tx)
+	}, existingChainRules, tx)
 }

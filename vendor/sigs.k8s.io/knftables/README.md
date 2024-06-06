@@ -7,9 +7,11 @@ specifically focuses on supporting Kubernetes components which are
 using nftables in the way that nftables is supposed to be used (as
 opposed to using nftables in a naively-translated-from-iptables way,
 or using nftables to do totally valid things that aren't the sorts of
-things Kubernetes components are likely to need to do).
+things Kubernetes components are likely to need to do; see the
+"[iptables porting](./docs/iptables-porting.md)" doc for more thoughts
+on porting old iptables-based components to nftables.)
 
-It is still under development and is not yet API stable. (See the
+knftables is still under development and is not yet API stable. (See the
 section on "Possible future changes" below.)
 
 The library is implemented as a wrapper around the `nft` CLI, because
@@ -58,8 +60,7 @@ below.)
 You can use the `List`, `ListRules`, and `ListElements` methods on the
 `Interface` to check if objects exist. `List` returns the names of
 `"chains"`, `"sets"`, or `"maps"` in the table, while `ListElements`
-returns `Element` objects and `ListRules` returns *partial* `Rule`
-objects.
+returns `Element` objects and `ListRules` returns `Rule` objects.
 
 ```golang
 chains, err := nft.List(ctx, "chains")
@@ -172,14 +173,6 @@ The "destroy" (delete-without-ENOENT) command that exists in newer
 versions of `nft` is not currently supported because it would be
 unexpectedly heavyweight to emulate on systems that don't have it, so
 it is better (for now) to force callers to implement it by hand.
-
-`ListRules` returns `Rule` objects without the `Rule` field filled in,
-because it uses the JSON API to list the rules, but there is no easy
-way to convert the JSON rule representation back into plaintext form.
-This means that it is only useful when either (a) you know the order
-of the rules in the chain, but want to know their handles, or (b) you
-can recognize the rules you are looking for by their comments, rather
-than the rule bodies.
 
 ## Possible future changes
 

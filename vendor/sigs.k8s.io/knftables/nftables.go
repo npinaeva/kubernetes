@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -43,7 +44,8 @@ type Interface interface {
 	// list and no error.
 	List(ctx context.Context, objectType string) ([]string, error)
 
-	// ListRules returns a list of the rules in a chain, in order. Note that at the
+	// ListRules returns a list of the rules in a chain, in order. If no chain name is
+	// specified, then all rules within the table will be returned. Note that at the
 	// present time, the Rule objects will have their `Comment` and `Handle` fields
 	// filled in, but *not* the actual `Rule` field. So this can only be used to find
 	// the handles of rules if they have unique comments to recognize them by, or if
@@ -296,23 +298,87 @@ func (nft *realNFTables) List(ctx context.Context, objectType string) ([]string,
 	return result, nil
 }
 
+// parsePlaintextRules takes plaintext (non-JSON) "nft -a list chain" output and creates a
+// map from handle to rule string (including comment). This is best-effort so it never
+// returns an error.
+func parsePlaintextRules(listOutput string) map[int]string {
+	// listOutput looks like:
+	//
+	// table inet firewalld { # handle 1
+	//     chain filter_INPUT { # handle 165
+	//         type filter hook input priority filter + 10; policy accept;
+	//         ct state { established, related } accept # handle 169
+	//         ct status dnat accept # handle 170
+	//         iifname "lo" accept # handle 171
+	//         ...
+	//     }
+	// }
+	//
+	// We assume that every line that has a handle and doesn't end with "{" before the
+	// handle is a rule.
+
+	lines := strings.Split(listOutput, "\n")
+	rules := make(map[int]string)
+	for _, line := range lines {
+		line := strings.TrimSpace(line)
+		parts := strings.Split(line, " # handle ")
+		if len(parts) != 2 || strings.HasSuffix(parts[0], "{") {
+			continue
+		}
+		rule, handleStr := parts[0], parts[1]
+
+		if comment := strings.LastIndex(rule, ` comment "`); comment != -1 {
+			rule = rule[:comment]
+		}
+		handle, err := strconv.Atoi(handleStr)
+		if err != nil {
+			continue
+		}
+		rules[handle] = rule
+	}
+
+	return rules
+}
+
 // ListRules is part of Interface
 func (nft *realNFTables) ListRules(ctx context.Context, chain string) ([]*Rule, error) {
-	cmd := exec.CommandContext(ctx, nft.path, "--json", "list", "chain", string(nft.family), nft.table, chain)
+	var cmd *exec.Cmd
+	if chain == "" {
+		cmd = exec.CommandContext(ctx, nft.path, "--json", "list", "table", string(nft.family), nft.table)
+	} else {
+		cmd = exec.CommandContext(ctx, nft.path, "--json", "list", "chain", string(nft.family), nft.table, chain)
+	}
 	out, err := nft.exec.Run(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to run nft: %w", err)
 	}
-
 	jsonRules, err := getJSONObjects(out, "rule")
 	if err != nil {
 		return nil, fmt.Errorf("unable to parse JSON output: %w", err)
 	}
 
 	rules := make([]*Rule, 0, len(jsonRules))
+	if len(jsonRules) == 0 {
+		return rules, nil
+	}
+
+	// Re-fetch the rules in plaintext format
+	if chain == "" {
+		cmd = exec.CommandContext(ctx, nft.path, "--handle", "list", "table", string(nft.family), nft.table)
+	} else {
+		cmd = exec.CommandContext(ctx, nft.path, "--handle", "list", "chain", string(nft.family), nft.table, chain)
+	}
+	out, err = nft.exec.Run(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to run nft: %w", err)
+	}
+	// parsePlaintextRules will return a map from handle to plaintext rule
+	plaintextRules := parsePlaintextRules(out)
+
 	for _, jsonRule := range jsonRules {
-		rule := &Rule{
-			Chain: chain,
+		parentChain, ok := jsonVal[string](jsonRule, "chain")
+		if !ok {
+			return nil, fmt.Errorf("unexpected JSON output from nft (rule with no chain)")
 		}
 
 		// handle is written as an integer in nft's output, but json.Unmarshal
@@ -320,8 +386,19 @@ func (nft *realNFTables) ListRules(ctx context.Context, chain string) ([]*Rule, 
 		// assigned consecutively starting from 1, so as long as fewer than 2**53
 		// nftables objects have been created since boot time, we won't run into
 		// float64-vs-uint64 precision issues.)
-		if handle, ok := jsonVal[float64](jsonRule, "handle"); ok {
-			rule.Handle = PtrTo(int(handle))
+		handleFloat, ok := jsonVal[float64](jsonRule, "handle")
+		if !ok {
+			continue
+		}
+		handle := int(handleFloat)
+
+		rule := &Rule{
+			Chain:  parentChain,
+			Handle: &handle,
+
+			// Grab the corresponding rule from the plaintext output rather
+			// than trying to figure out the JSON one.
+			Rule: plaintextRules[handle],
 		}
 		if comment, ok := jsonVal[string](jsonRule, "comment"); ok {
 			rule.Comment = &comment
@@ -404,7 +481,7 @@ func (nft *realNFTables) ListElements(ctx context.Context, objectType, name stri
 	return elements, nil
 }
 
-// parseElementValue parses a JSON element key/value, handling concatenations, and
+// parseElementValue parses a JSON element key/value, handling concatenations, prefixes, and
 // converting numeric or "verdict" values to strings.
 func parseElementValue(json interface{}) ([]string, error) {
 	// json can be:
@@ -412,6 +489,14 @@ func parseElementValue(json interface{}) ([]string, error) {
 	//   - a single string, e.g. "192.168.1.3"
 	//
 	//   - a single number, e.g. 80
+	//
+	//   - a prefix, expressed as an object:
+	//     {
+	//       "prefix": {
+	//         "addr": "192.168.0.0",
+	//         "len": 16,
+	//       }
+	//     }
 	//
 	//   - a concatenation, expressed as an object containing an array of simple
 	//     values:
@@ -452,6 +537,17 @@ func parseElementValue(json interface{}) ([]string, error) {
 				}
 			}
 			return vals, nil
+		} else if prefix, _ := jsonVal[map[string]interface{}](val, "prefix"); prefix != nil {
+			// For prefix-type elements, return the element in CIDR representation.
+			addr, ok := jsonVal[string](prefix, "addr")
+			if !ok {
+				return nil, fmt.Errorf("could not parse 'addr' value as string: %q", prefix)
+			}
+			length, ok := jsonVal[float64](prefix, "len")
+			if !ok {
+				return nil, fmt.Errorf("could not parse 'len' value as number: %q", prefix)
+			}
+			return []string{fmt.Sprintf("%s/%d", addr, int(length))}, nil
 		} else if len(val) == 1 {
 			var verdict string
 			// We just checked that len(val) == 1, so this loop body will only
