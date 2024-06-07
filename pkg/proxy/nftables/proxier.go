@@ -975,6 +975,50 @@ func isAffinitySetName(set string) bool {
 	return strings.HasPrefix(set, servicePortEndpointAffinityNamePrefix)
 }
 
+func (proxier *Proxier) getOrFlushSingleKeySet(setName string, tx *knftables.Transaction) sets.Set[string] {
+	result := sets.New[string]()
+	listStart := time.Now()
+	setElems, err := proxier.nftables.ListElements(context.TODO(), "set", setName)
+	proxier.logger.V(2).Info("List set elements", "set", setName, "elapsed", time.Since(listStart))
+	if err != nil {
+		proxier.logger.Error(err, fmt.Sprintf("Failed to list nftables %s set elements", setName))
+		tx.Flush(&knftables.Set{
+			Name: setName,
+		})
+		return result
+	}
+	for _, elem := range setElems {
+		if len(elem.Key) != 1 {
+			proxier.logger.V(2).Info("Found set element with more than one key, ignoring", "set", setName, "key", elem.Key)
+			continue
+		}
+		result.Insert(elem.Key[0])
+	}
+	return result
+}
+
+func (proxier *Proxier) getOrFlushSingleValueMap(mapName string, tx *knftables.Transaction) map[string]string {
+	result := map[string]string{}
+	listStart := time.Now()
+	mapElems, err := proxier.nftables.ListElements(context.TODO(), "map", mapName)
+	proxier.logger.V(2).Info("List set elements", "map", mapName, "elapsed", time.Since(listStart))
+	if err != nil {
+		proxier.logger.Error(err, fmt.Sprintf("Failed to list nftables %s map elements", mapName))
+		tx.Flush(&knftables.Map{
+			Name: mapName,
+		})
+		return result
+	}
+	for _, elem := range mapElems {
+		if len(elem.Value) != 1 {
+			proxier.logger.V(2).Info("Found map value with len > 1, ignoring", "map", mapName, "value", elem.Value)
+			continue
+		}
+		result[mapJoinKey(elem.Key)] = elem.Value[0]
+	}
+	return result
+}
+
 // This is where all of the nftables calls happen.
 // This assumes proxier.mu is NOT held
 func (proxier *Proxier) syncProxyRules() {
@@ -1051,25 +1095,13 @@ func (proxier *Proxier) syncProxyRules() {
 		ipvX_addr = "ipv6_addr"
 	}
 
-	// We currently fully-rebuild our sets and maps on each resync
-	tx.Flush(&knftables.Set{
-		Name: clusterIPsSet,
-	})
-	tx.Flush(&knftables.Map{
-		Name: firewallIPsMap,
-	})
-	tx.Flush(&knftables.Map{
-		Name: noEndpointServicesMap,
-	})
-	tx.Flush(&knftables.Map{
-		Name: noEndpointNodePortsMap,
-	})
-	tx.Flush(&knftables.Map{
-		Name: serviceIPsMap,
-	})
-	tx.Flush(&knftables.Map{
-		Name: serviceNodePortsMap,
-	})
+	// Get the required info from nftables
+	existingClusterIPs := proxier.getOrFlushSingleKeySet(clusterIPsSet, tx)
+	existingServiceIPs := proxier.getOrFlushSingleValueMap(serviceIPsMap, tx)
+	existingFirewallIPs := proxier.getOrFlushSingleValueMap(firewallIPsMap, tx)
+	existingNoEndpointServices := proxier.getOrFlushSingleValueMap(noEndpointServicesMap, tx)
+	existingNoEndpointNodePorts := proxier.getOrFlushSingleValueMap(noEndpointNodePortsMap, tx)
+	existingServiceNodePorts := proxier.getOrFlushSingleValueMap(serviceNodePortsMap, tx)
 
 	// Accumulate service/endpoint chains and affinity sets to keep.
 	activeChains := sets.New[string]()
@@ -1195,12 +1227,12 @@ func (proxier *Proxier) syncProxyRules() {
 		}
 
 		// Capture the clusterIP.
-		tx.Add(&knftables.Element{
+		addSingleKeySetElem(&knftables.Element{
 			Set: clusterIPsSet,
 			Key: []string{svcInfo.ClusterIP().String()},
-		})
+		}, existingClusterIPs, tx)
 		if hasInternalEndpoints {
-			tx.Add(&knftables.Element{
+			addSingleValueMapElem(&knftables.Element{
 				Map: serviceIPsMap,
 				Key: []string{
 					svcInfo.ClusterIP().String(),
@@ -1210,10 +1242,10 @@ func (proxier *Proxier) syncProxyRules() {
 				Value: []string{
 					fmt.Sprintf("goto %s", internalTrafficChain),
 				},
-			})
+			}, existingServiceIPs, tx)
 		} else {
 			// No endpoints.
-			tx.Add(&knftables.Element{
+			addSingleValueMapElem(&knftables.Element{
 				Map: noEndpointServicesMap,
 				Key: []string{
 					svcInfo.ClusterIP().String(),
@@ -1224,7 +1256,7 @@ func (proxier *Proxier) syncProxyRules() {
 					internalTrafficFilterVerdict,
 				},
 				Comment: &svcPortNameString,
-			})
+			}, existingNoEndpointServices, tx)
 		}
 
 		// Capture externalIPs.
@@ -1232,7 +1264,7 @@ func (proxier *Proxier) syncProxyRules() {
 			if hasEndpoints {
 				// Send traffic bound for external IPs to the "external
 				// destinations" chain.
-				tx.Add(&knftables.Element{
+				addSingleValueMapElem(&knftables.Element{
 					Map: serviceIPsMap,
 					Key: []string{
 						externalIP.String(),
@@ -1242,13 +1274,13 @@ func (proxier *Proxier) syncProxyRules() {
 					Value: []string{
 						fmt.Sprintf("goto %s", externalTrafficChain),
 					},
-				})
+				}, existingServiceIPs, tx)
 			}
 			if !hasExternalEndpoints {
 				// Either no endpoints at all (REJECT) or no endpoints for
 				// external traffic (DROP anything that didn't get
 				// short-circuited by the EXT chain.)
-				tx.Add(&knftables.Element{
+				addSingleValueMapElem(&knftables.Element{
 					Map: noEndpointServicesMap,
 					Key: []string{
 						externalIP.String(),
@@ -1259,7 +1291,7 @@ func (proxier *Proxier) syncProxyRules() {
 						externalTrafficFilterVerdict,
 					},
 					Comment: &svcPortNameString,
-				})
+				}, existingNoEndpointServices, tx)
 			}
 		}
 
@@ -1300,7 +1332,7 @@ func (proxier *Proxier) syncProxyRules() {
 		// Capture load-balancer ingress.
 		for _, lbip := range svcInfo.LoadBalancerVIPs() {
 			if hasEndpoints {
-				tx.Add(&knftables.Element{
+				addSingleValueMapElem(&knftables.Element{
 					Map: serviceIPsMap,
 					Key: []string{
 						lbip.String(),
@@ -1310,11 +1342,11 @@ func (proxier *Proxier) syncProxyRules() {
 					Value: []string{
 						fmt.Sprintf("goto %s", externalTrafficChain),
 					},
-				})
+				}, existingServiceIPs, tx)
 			}
 
 			if usesFWChain {
-				tx.Add(&knftables.Element{
+				addSingleValueMapElem(&knftables.Element{
 					Map: firewallIPsMap,
 					Key: []string{
 						lbip.String(),
@@ -1325,7 +1357,7 @@ func (proxier *Proxier) syncProxyRules() {
 						fmt.Sprintf("goto %s", fwChain),
 					},
 					Comment: &svcPortNameString,
-				})
+				}, existingFirewallIPs, tx)
 			}
 		}
 		if !hasExternalEndpoints {
@@ -1333,7 +1365,7 @@ func (proxier *Proxier) syncProxyRules() {
 			// external traffic (DROP anything that didn't get short-circuited
 			// by the EXT chain.)
 			for _, lbip := range svcInfo.LoadBalancerVIPs() {
-				tx.Add(&knftables.Element{
+				addSingleValueMapElem(&knftables.Element{
 					Map: noEndpointServicesMap,
 					Key: []string{
 						lbip.String(),
@@ -1344,7 +1376,7 @@ func (proxier *Proxier) syncProxyRules() {
 						externalTrafficFilterVerdict,
 					},
 					Comment: &svcPortNameString,
-				})
+				}, existingNoEndpointServices, tx)
 			}
 		}
 
@@ -1354,7 +1386,7 @@ func (proxier *Proxier) syncProxyRules() {
 				// Jump to the external destination chain.  For better or for
 				// worse, nodeports are not subject to loadBalancerSourceRanges,
 				// and we can't change that.
-				tx.Add(&knftables.Element{
+				addSingleValueMapElem(&knftables.Element{
 					Map: serviceNodePortsMap,
 					Key: []string{
 						protocol,
@@ -1363,13 +1395,13 @@ func (proxier *Proxier) syncProxyRules() {
 					Value: []string{
 						fmt.Sprintf("goto %s", externalTrafficChain),
 					},
-				})
+				}, existingServiceNodePorts, tx)
 			}
 			if !hasExternalEndpoints {
 				// Either no endpoints at all (REJECT) or no endpoints for
 				// external traffic (DROP anything that didn't get
 				// short-circuited by the EXT chain.)
-				tx.Add(&knftables.Element{
+				addSingleValueMapElem(&knftables.Element{
 					Map: noEndpointNodePortsMap,
 					Key: []string{
 						protocol,
@@ -1379,7 +1411,7 @@ func (proxier *Proxier) syncProxyRules() {
 						externalTrafficFilterVerdict,
 					},
 					Comment: &svcPortNameString,
-				})
+				}, existingNoEndpointNodePorts, tx)
 			}
 		}
 
@@ -1596,7 +1628,9 @@ func (proxier *Proxier) syncProxyRules() {
 	}
 
 	// OTOH, we can immediately delete any stale affinity sets
+	listStart := time.Now()
 	existingSets, err := proxier.nftables.List(context.TODO(), "sets")
+	proxier.logger.V(2).Info("List sets", "elapsed", time.Since(listStart))
 	if err == nil {
 		for _, set := range existingSets {
 			if isAffinitySetName(set) && !activeAffinitySets.Has(set) {
@@ -1609,6 +1643,13 @@ func (proxier *Proxier) syncProxyRules() {
 		proxier.logger.Error(err, "Failed to list nftables sets: stale affinity sets will not be deleted")
 	}
 
+	cleanupSetLeftovers(clusterIPsSet, existingClusterIPs, tx)
+	cleanupMapLeftovers(serviceIPsMap, existingServiceIPs, tx)
+	cleanupMapLeftovers(firewallIPsMap, existingFirewallIPs, tx)
+	cleanupMapLeftovers(noEndpointServicesMap, existingNoEndpointServices, tx)
+	cleanupMapLeftovers(noEndpointNodePortsMap, existingNoEndpointNodePorts, tx)
+	cleanupMapLeftovers(serviceNodePortsMap, existingServiceNodePorts, tx)
+
 	// Sync rules.
 	proxier.logger.V(2).Info("Reloading service nftables data",
 		"numServices", len(proxier.svcPortMap),
@@ -1619,6 +1660,7 @@ func (proxier *Proxier) syncProxyRules() {
 		klogV9.InfoS("Running nftables transaction", "transaction", tx.String())
 	}
 
+	txStart := time.Now()
 	err = proxier.nftables.Run(context.TODO(), tx)
 	if err != nil {
 		proxier.logger.Error(err, "nftables sync failed")
@@ -1629,6 +1671,7 @@ func (proxier *Proxier) syncProxyRules() {
 		clear(proxier.staleChains)
 		return
 	}
+	proxier.logger.V(2).Info("nftables TX succeeded", "elapsed", time.Since(txStart), "tx.len", tx.Len())
 	success = true
 
 	for name, lastChangeTriggerTimes := range endpointUpdateResult.LastChangeTriggerTimes {
@@ -1658,6 +1701,59 @@ func (proxier *Proxier) syncProxyRules() {
 
 	// Finish housekeeping, clear stale conntrack entries for UDP Services
 	conntrack.CleanStaleEntries(proxier.conntrack, proxier.svcPortMap, serviceUpdateResult, endpointUpdateResult)
+}
+
+func mapJoinKey(mapKeys []string) string {
+	return strings.Join(mapKeys, ",")
+}
+
+func mapSplitKey(joinedKey string) []string {
+	return strings.Split(joinedKey, ",")
+}
+
+func addSingleKeySetElem(elem *knftables.Element, existingSetKeys sets.Set[string], tx *knftables.Transaction) {
+	elemKey := elem.Key[0]
+	if len(elem.Key) != 1 || !existingSetKeys.Has(elemKey) {
+		tx.Add(elem)
+	} else {
+		existingSetKeys.Delete(elemKey)
+	}
+}
+
+func addSingleValueMapElem(elem *knftables.Element, existingMapKeys map[string]string, tx *knftables.Transaction) {
+	elemKey := mapJoinKey(elem.Key)
+	existingValue, ok := existingMapKeys[elemKey]
+	if len(elem.Value) == 1 && ok {
+		// map key already exists, check value
+		if existingValue != elem.Value[0] {
+			tx.Delete(&knftables.Element{
+				Map: elem.Map,
+				Key: elem.Key,
+			})
+			tx.Add(elem)
+		}
+		delete(existingMapKeys, elemKey)
+	} else {
+		tx.Add(elem)
+	}
+}
+
+func cleanupSetLeftovers(setName string, existingSetKeys sets.Set[string], tx *knftables.Transaction) {
+	for key := range existingSetKeys {
+		tx.Delete(&knftables.Element{
+			Set: setName,
+			Key: []string{key},
+		})
+	}
+}
+
+func cleanupMapLeftovers(mapName string, existingMapKeys map[string]string, tx *knftables.Transaction) {
+	for key := range existingMapKeys {
+		tx.Delete(&knftables.Element{
+			Map: mapName,
+			Key: mapSplitKey(key),
+		})
+	}
 }
 
 func (proxier *Proxier) writeServiceToEndpointRules(tx *knftables.Transaction, svcInfo *servicePortInfo, svcChain string, endpoints []proxy.Endpoint) {
