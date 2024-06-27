@@ -1143,7 +1143,9 @@ func (proxier *Proxier) syncProxyRules() {
 
 	// Now start the actual syncing transaction
 	tx := proxier.nftables.NewTransaction()
-	proxier.setupNFTables(tx)
+	if !tryPartialSync {
+		proxier.setupNFTables(tx)
+	}
 
 	// We need to use, eg, "ip daddr" for IPv4 but "ip6 daddr" for IPv6
 	ipX := "ip"
